@@ -1,21 +1,23 @@
-package main
+ package main
 
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// Global Config & State
+// --- CONFIG & GLOBAL STATE ---
 type Config struct {
 	Primary  string
 	Accent   string
@@ -23,9 +25,9 @@ type Config struct {
 }
 
 var currentStyle = Config{
-	Primary:  "\033[36m", 
-	Accent:   "\033[35m", 
-	Location: time.Local, 
+	Primary:  "\033[36m",
+	Accent:   "\033[35m",
+	Location: time.Local,
 }
 
 const (
@@ -37,7 +39,61 @@ const (
 )
 
 var commandHistory []string
-var shellPassword = "sharp" // Default password for the lock command
+var shellPassword = "sharp"
+
+// Upgraded Alias System
+type AliasEntry struct {
+	Cmd      string `json:"cmd"`
+	Location string `json:"location"` // "Sharp" or "Linux"
+}
+
+var aliases = make(map[string]AliasEntry)
+var aliasTrash = make(map[string]AliasEntry)
+
+const aliasFile = ".sharp_aliases.json"
+const trashFile = ".sharp_trash.json"
+
+// --- PERSISTENCE ---
+
+func saveAliases() {
+	home, _ := os.UserHomeDir()
+	d1, _ := json.Marshal(aliases); os.WriteFile(filepath.Join(home, aliasFile), d1, 0644)
+	d2, _ := json.Marshal(aliasTrash); os.WriteFile(filepath.Join(home, trashFile), d2, 0644)
+}
+
+func loadAliases() {
+	home, _ := os.UserHomeDir()
+	if d1, err := os.ReadFile(filepath.Join(home, aliasFile)); err == nil { json.Unmarshal(d1, &aliases) }
+	if d2, err := os.ReadFile(filepath.Join(home, trashFile)); err == nil { json.Unmarshal(d2, &aliasTrash) }
+}
+
+// --- LINUX BASHRC HELPERS ---
+
+func addLinuxAlias(name, cmd string) {
+	home, _ := os.UserHomeDir()
+	f, _ := os.OpenFile(filepath.Join(home, ".bashrc"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	defer f.Close()
+	f.WriteString(fmt.Sprintf("\nalias %s='%s'\n", name, cmd))
+}
+
+func removeLinuxAlias(name string) {
+	home, _ := os.UserHomeDir()
+	bashrc := filepath.Join(home, ".bashrc")
+	data, err := os.ReadFile(bashrc)
+	if err != nil { return }
+	lines := strings.Split(string(data), "\n")
+	var newLines []string
+	prefix1, prefix2 := "alias "+name+"=", "alias "+name+" ="
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, prefix1) && !strings.HasPrefix(trimmed, prefix2) {
+			newLines = append(newLines, line)
+		}
+	}
+	os.WriteFile(bashrc, []byte(strings.Join(newLines, "\n")), 0644)
+}
+
+// --- UTILITIES ---
 
 func getBanner() string {
 	return `
@@ -52,321 +108,364 @@ func getBanner() string {
 }
 
 func notify(msg string, nType string) {
-	var icon string
+	var icon, prefix string
 	switch nType {
-	case "err":
-		icon = Red + "[✖] "
-	case "warn":
-		icon = Yellow + "[!] "
-	case "success":
-		icon = Green + "[✔] "
-	default:
-		icon = currentStyle.Primary + "[⚡] "
+	case "err": icon, prefix = Red+"[✖] ", "ERROR: "
+	case "warn": icon, prefix = Yellow+"[!] ", "ATTENTION: "
+	case "success": icon, prefix = Green+"[✔] ", "FINALLY: "
+	default: icon, prefix = currentStyle.Primary+"[⚡] ", "INFO: "
 	}
-	fmt.Printf("%s%s%s\n", icon, msg, Reset)
+	fmt.Printf("%s%s%s%s\n", icon, Bold, prefix, Reset+msg)
 }
 
-// ---------------------------------------------------------
-// NEW COMMAND HANDLERS
-// ---------------------------------------------------------
+func handleNotifyUsage() {
+	fmt.Println(Bold + "\n--- SHARP NOTIFICATION SYSTEM ---" + Reset)
+	notify("For successful tasks (rare for you, huh?).", "success")
+	notify("For when you're about to break something.", "warn")
+	notify("For when you actually broke it. Good job.", "err")
+	notify("Generic system spam.", "info")
+	fmt.Println()
+}
+
+// --- ALIAS MANAGER (NEW) ---
+
+func handleAlias(input string) { // Legacy single-line add
+	clean := strings.TrimPrefix(input, "alias ")
+	parts := strings.SplitN(clean, "=", 2)
+	if len(parts) != 2 { notify("It's 'alias name=cmd'. Is that too much to remember?", "err"); return }
+	name := strings.TrimSpace(parts[0])
+	val := strings.Trim(strings.TrimSpace(parts[1]), "'\"")
+	aliases[name] = AliasEntry{Cmd: val, Location: "Sharp"}
+	saveAliases()
+	notify(fmt.Sprintf("I'll remember '%s' in Sharp memory.", name), "success")
+}
+
+func handleGetAlias() {
+	fmt.Println(Bold + "\n--- ALIAS MANAGER ---" + Reset)
+	if len(aliases) == 0 {
+		fmt.Println("No aliases found. Your life is unoptimized.")
+	} else {
+		fmt.Printf("%-15s | %-10s | %s\n", "NAME", "LOCATION", "COMMAND")
+		fmt.Println(strings.Repeat("-", 45))
+		for name, entry := range aliases {
+			locColor := Yellow; if entry.Location == "Linux" { locColor = currentStyle.Primary }
+			fmt.Printf("%s%-15s%s | %s%-10s%s | %s\n", Bold, name, Reset, locColor, entry.Location, Reset, entry.Cmd)
+		}
+	}
+	
+	fmt.Println("\n1. Add | 2. Remove | Press Enter to exit")
+	fmt.Print("Choice: ")
+	reader := bufio.NewReader(os.Stdin)
+	opt, _ := reader.ReadString('\n')
+	opt = strings.TrimSpace(opt)
+
+	switch opt {
+	case "1":
+		fmt.Print("Name (e.g. ll): "); name, _ := reader.ReadString('\n'); name = strings.TrimSpace(name)
+		fmt.Print("Command (e.g. ls -la): "); cmd, _ := reader.ReadString('\n'); cmd = strings.TrimSpace(cmd)
+		fmt.Print("Location? (1: Sharp, 2: Linux): "); loc, _ := reader.ReadString('\n'); loc = strings.TrimSpace(loc)
+		
+		if loc == "2" {
+			addLinuxAlias(name, cmd)
+			aliases[name] = AliasEntry{Cmd: cmd, Location: "Linux"}
+			notify("Added to Linux ~/.bashrc and mapped.", "success")
+		} else {
+			aliases[name] = AliasEntry{Cmd: cmd, Location: "Sharp"}
+			notify("Added to Sharp memory.", "success")
+		}
+		saveAliases()
+
+	case "2":
+		fmt.Print("Enter name to terminate: "); name, _ := reader.ReadString('\n'); name = strings.TrimSpace(name)
+		if entry, exists := aliases[name]; exists {
+			if entry.Location == "Linux" {
+				removeLinuxAlias(name)
+				delete(aliases, name)
+				notify(fmt.Sprintf("Annihilated '%s' from ~/.bashrc and memory.", name), "success")
+			} else {
+				aliasTrash[name] = entry
+				delete(aliases, name)
+				notify(fmt.Sprintf("Moved '%s' to the Trash. Scared of commitment?", name), "warn")
+			}
+			saveAliases()
+		} else {
+			notify("That alias doesn't exist. Are you imagining things?", "err")
+		}
+	}
+}
+
+func handleGetAliasTrash(args []string) {
+	if len(args) == 0 || args[0] != "-list" {
+		notify("Usage: getAliasTrash -list", "warn"); return
+	}
+	fmt.Println(Bold + "\n--- ALIAS TRASH BIN ---" + Reset)
+	if len(aliasTrash) == 0 { notify("Trash is empty. Wow, you actually cleaned up.", "info"); return }
+	
+	for name, entry := range aliasTrash { fmt.Printf("- %s -> %s\n", name, entry.Cmd) }
+	
+	fmt.Print("\nEnter name to recover (or press Enter to leave them to rot): ")
+	reader := bufio.NewReader(os.Stdin)
+	name, _ := reader.ReadString('\n')
+	name = strings.TrimSpace(name)
+	
+	if entry, exists := aliasTrash[name]; exists {
+		aliases[name] = entry
+		delete(aliasTrash, name)
+		saveAliases()
+		notify("Recovered '"+name+"'. Welcome back from the dead.", "success")
+	}
+}
+
+// --- CORE HANDLERS ---
 
 func handleFetch() {
 	fmt.Println()
 	fmt.Println(currentStyle.Primary + "  /\\_/\\" + Reset + "    OS:      Termux / Linux")
-	fmt.Println(currentStyle.Primary + " ( o.o )" + Reset + "   Shell:   SHARP-shell v1.5")
+	fmt.Println(currentStyle.Primary + " ( o.o )" + Reset + "   Shell:   SHARP-shell v2.0")
 	fmt.Println(currentStyle.Primary + "  > ^ < " + Reset + "   Creator: @Rioareos")
-	fmt.Printf("           Engine:  Go %s\n", runtime.Version())
-	fmt.Printf("           Arch:    %s\n\n", runtime.GOARCH)
+	fmt.Printf("           Engine:  Go %s | Salt Level: Maximum\n\n", runtime.Version())
 }
 
 func handleMatrix() {
-	notify("Entering the matrix...", "warn")
+	notify("Trying to look like a hacker? Cute.", "warn")
 	chars := []rune("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ@#$%^&*")
 	for i := 0; i < 40; i++ {
 		line := ""
-		for j := 0; j < 80; j++ {
-			line += string(chars[rand.Intn(len(chars))])
-		}
+		for j := 0; j < 80; j++ { line += string(chars[rand.Intn(len(chars))]) }
 		fmt.Println(Green + line + Reset)
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond)
 	}
-	notify("Matrix sequence complete.", "success")
 }
 
 func handleBreathe() {
-	notify("Take a moment to relax...", "success")
-	fmt.Print(currentStyle.Primary + "Inhale... " + Reset)
-	time.Sleep(3 * time.Second)
-	fmt.Print(Yellow + "Hold... " + Reset)
-	time.Sleep(3 * time.Second)
-	fmt.Println(Green + "Exhale... ˃ 𖥦 ˂" + Reset)
-	time.Sleep(4 * time.Second)
+	notify("You look stressed. Calm down before you break my code.", "success")
+	fmt.Print(currentStyle.Primary + "Inhale... " + Reset); time.Sleep(3 * time.Second)
+	fmt.Print(Yellow + "Hold... " + Reset); time.Sleep(3 * time.Second)
+	fmt.Println(Green + "Exhale... Better? ˃ 𖥦 ˂" + Reset); time.Sleep(2 * time.Second)
 }
 
-func handleDiary(args []string) {
-	homeDir := os.Getenv("HOME")
-	diaryPath := filepath.Join(homeDir, "sharp_diary.txt")
-	
+func handleDiary(args []string, readMode bool) {
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, "sharp_diary.txt")
+	if readMode {
+		data, err := os.ReadFile(path)
+		if err != nil { notify("Your diary is as empty as my soul.", "warn"); return }
+		fmt.Println(currentStyle.Accent + "\n--- Your Deepest Regrets ---\n" + string(data) + "----------------------------\n" + Reset)
+		return
+	}
+	if len(args) == 0 { notify("Write something. I don't have all day.", "err"); return }
 	entry := strings.Join(args, " ")
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	fullEntry := fmt.Sprintf("[%s] %s\n", timestamp, entry)
-
-	f, err := os.OpenFile(diaryPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		notify("Could not open diary file.", "err")
-		return
-	}
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	defer f.Close()
-	f.WriteString(fullEntry)
-	notify("Secret diary entry saved! 🐾", "success")
-}
-
-func handleReadDiary() {
-	homeDir := os.Getenv("HOME")
-	diaryPath := filepath.Join(homeDir, "sharp_diary.txt")
-	data, err := os.ReadFile(diaryPath)
-	if err != nil {
-		notify("Diary is empty or not found.", "warn")
-		return
-	}
-	fmt.Println(currentStyle.Accent + "\n--- Your Secret Diary ---" + Reset)
-	fmt.Print(string(data))
-	fmt.Println(currentStyle.Accent + "-------------------------\n" + Reset)
+	f.WriteString(fmt.Sprintf("[%s] %s\n", ts, entry))
+	notify("Saved. Don't worry, I won't tell anyone... maybe.", "success")
 }
 
 func handleCalc(args []string) {
-	if len(args) != 3 {
-		notify("Usage: calc <num> <op> <num> (e.g., calc 5 + 10)", "err")
-		return
-	}
-	num1, err1 := strconv.ParseFloat(args[0], 64)
-	num2, err2 := strconv.ParseFloat(args[2], 64)
-	if err1 != nil || err2 != nil {
-		notify("Invalid numbers!", "err")
-		return
-	}
-	
-	var result float64
+	if len(args) != 3 { notify("Format: 'calc 2 + 2'. Math isn't that hard, is it?", "err"); return }
+	n1, err1 := strconv.ParseFloat(args[0], 64)
+	n2, err2 := strconv.ParseFloat(args[2], 64)
+	if err1 != nil || err2 != nil { notify("Those aren't numbers. Try again, genius.", "err"); return }
+	var res float64
 	switch args[1] {
-	case "+": result = num1 + num2
-	case "-": result = num1 - num2
-	case "*": result = num1 * num2
-	case "/":
-		if num2 == 0 { notify("Cannot divide by zero!", "err"); return }
-		result = num1 / num2
-	default:
-		notify("Unknown operator. Use +, -, *, /", "err")
-		return
+	case "+": res = n1 + n2
+	case "-": res = n1 - n2
+	case "*": res = n1 * n2
+	case "/": 
+		if n2 == 0 { notify("Dividing by zero? You're trying to kill me.", "err"); return }
+		res = n1 / n2
+	default: notify("Unknown operator. I only do the basics.", "err"); return
 	}
-	notify(fmt.Sprintf("Result: %v", result), "success")
+	notify(fmt.Sprintf("Result: %v (Wow, you couldn't do that in your head?)", res), "success")
 }
 
-func handleWeather(args []string) {
-	city := ""
-	if len(args) > 0 { city = args[0] }
-	cmd := exec.Command("curl", "wttr.in/"+city+"?0")
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+func handlePkg(args []string) {
+	notify("Invoking the package manager. Hope you know what you're doing.", "warn")
+	cmd := exec.Command("pkg", args...)
+	var buf bytes.Buffer
+	multi := io.MultiWriter(os.Stdout, &buf)
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = multi, multi, os.Stdin
 	cmd.Run()
 }
 
-func handleLock(scanner *bufio.Scanner) {
-	fmt.Print("\033[H\033[2J") // Clear screen
-	fmt.Println(Red + Bold + "=== SHELL LOCKED ===" + Reset)
-	for {
-		fmt.Print("Enter password to unlock: ")
-		if !scanner.Scan() { os.Exit(0) }
-		if scanner.Text() == shellPassword {
-			notify("Shell unlocked! Welcome back. ˃ 𖥦 ˂", "success")
-			break
-		} else {
-			notify("Incorrect password.", "err")
+func handleSecure(args []string) {
+	if len(args) == 0 { notify("Usage: --secure <compiler> <file> -o <name> or --secure ./bin. Read carefully.", "warn"); return }
+	homeDir := os.Getenv("HOME")
+	var filesToClean []string
+	defer func() {
+		for _, f := range filesToClean { os.Remove(f) }
+		if len(filesToClean) > 0 { notify("Cleaned up your mess in $HOME.", "success") }
+	}()
+
+	if len(args) == 1 {
+		abs, _ := filepath.Abs(args[0])
+		dest := filepath.Join(homeDir, filepath.Base(args[0]))
+		data, err := os.ReadFile(abs)
+		if err != nil { notify("That file doesn't exist. Did you imagine it?", "err"); return }
+		os.WriteFile(dest, data, 0755)
+		filesToClean = append(filesToClean, dest)
+		notify("Running binary. Stay safe.", "success")
+		cmd := exec.Command(dest); cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+		cmd.Run(); return
+	}
+
+	if len(args) >= 4 {
+		src := args[1]; outputName := args[3]
+		visited := make(map[string]bool); queue := []string{src}
+		re := regexp.MustCompile(`^\s*#include\s+"([^"]+)"`)
+		for len(queue) > 0 {
+			curr := queue[0]; queue = queue[1:]
+			if visited[curr] { continue }; visited[curr] = true
+			abs, _ := filepath.Abs(curr)
+			data, err := os.ReadFile(abs)
+			if err != nil { continue }
+			destPath := filepath.Join(homeDir, filepath.Base(curr))
+			os.WriteFile(destPath, data, 0644)
+			filesToClean = append(filesToClean, destPath)
+			scan := bufio.NewScanner(bytes.NewReader(data))
+			for scan.Scan() {
+				if m := re.FindStringSubmatch(scan.Text()); len(m) > 1 { queue = append(queue, m[1]) }
+			}
 		}
+		destBin := filepath.Join(homeDir, outputName)
+		filesToClean = append(filesToClean, destBin)
+		notify("Compiling safely. Try not to have syntax errors.", "warn")
+		comp := exec.Command(args[0], filepath.Join(homeDir, filepath.Base(src)), "-o", destBin)
+		comp.Stdout, comp.Stderr = os.Stdout, os.Stderr
+		if err := comp.Run(); err == nil {
+			run := exec.Command(destBin); run.Stdout, run.Stderr, run.Stdin = os.Stdout, os.Stderr, os.Stdin
+			run.Run()
+		} else { notify("Compilation failed. Fix your code.", "err") }
 	}
 }
-
-// ---------------------------------------------------------
-// CORE SYSTEM
-// ---------------------------------------------------------
 
 func handleManage() {
-	fmt.Println(Bold + "\n--- SHARP MANAGEMENT ---" + Reset)
-	fmt.Println("1. [MAINTENANCE] | Sleep for X minutes/seconds")
-	fmt.Println("2. [SHARP STYLE] | Theme settings")
-	fmt.Println("3. [SHARP RESET] | Factory reset")
-	fmt.Print("\nSelect option (1-3): ")
-
+	fmt.Println(Bold + "\n--- SHARP SETTINGS ---" + Reset)
+	fmt.Println("1. Sleep | 2. Style | 3. Clear ALL Aliases")
+	fmt.Print("Choice: ")
 	reader := bufio.NewReader(os.Stdin)
-	choice, _ := reader.ReadString('\n')
-	choice = strings.TrimSpace(choice)
-
-	switch choice {
+	opt, _ := reader.ReadString('\n')
+	switch strings.TrimSpace(opt) {
 	case "1":
-		fmt.Print("Enter duration (e.g., 5m, 30s): ")
-		durStr, _ := reader.ReadString('\n')
-		duration, err := time.ParseDuration(strings.TrimSpace(strings.ToLower(durStr)))
-		if err != nil { notify("Invalid format!", "err"); return }
-		notify(fmt.Sprintf("Maintenance active. Sleeping for %v...", duration), "warn")
-		time.Sleep(duration)
-		notify("Maintenance complete! ˃ 𖥦 ˂", "success")
+		fmt.Print("Time? (e.g. 5s): "); d, _ := reader.ReadString('\n')
+		dur, _ := time.ParseDuration(strings.TrimSpace(d))
+		notify("Maintenance mode. Go get a coffee.", "warn")
+		time.Sleep(dur); notify("I'm back. Did you miss me?", "success")
 	case "2":
-		fmt.Println("A. Sakura Pink | B. Neon Green | C. Sky Blue")
-		fmt.Print("Pick one: ")
-		pick, _ := reader.ReadString('\n')
-		pick = strings.TrimSpace(strings.ToUpper(pick))
-		if pick == "A" { currentStyle.Primary, currentStyle.Accent = "\033[38;5;205m", "\033[38;5;213m" }
-		if pick == "B" { currentStyle.Primary, currentStyle.Accent = "\033[38;5;82m", "\033[38;5;154m" }
-		if pick == "C" { currentStyle.Primary, currentStyle.Accent = "\033[36m", "\033[35m" }
-		notify("Style updated!", "success")
-	case "3":
-		currentStyle.Primary, currentStyle.Accent = "\033[36m", "\033[35m"
-		fmt.Print("\033[H\033[2J")
-		fmt.Print(getBanner())
+		fmt.Println("A. Sakura | B. Neon | C. Classic")
+		p, _ := reader.ReadString('\n')
+		switch strings.ToUpper(strings.TrimSpace(p)) {
+		case "A": currentStyle.Primary, currentStyle.Accent = "\033[38;5;205m", "\033[38;5;213m"
+		case "B": currentStyle.Primary, currentStyle.Accent = "\033[38;5;82m", "\033[38;5;154m"
+		case "C": currentStyle.Primary, currentStyle.Accent = "\033[36m", "\033[35m"
+		}
+		notify("New skin, same old shell.", "success")
+	case "3": 
+		aliases = make(map[string]AliasEntry); aliasTrash = make(map[string]AliasEntry)
+		saveAliases(); notify("Memory wiped. Everything is gone.", "success")
 	}
 }
 
-func handlePkg(action string, args []string) {
-	fullArgs := append([]string{action}, args...)
-	cmd := exec.Command("pkg", fullArgs...)
-	var buf bytes.Buffer
-	multiWriter := io.MultiWriter(os.Stdout, &buf)
-	cmd.Stdout, cmd.Stderr, cmd.Stdin = multiWriter, multiWriter, os.Stdin
-	err := cmd.Run()
-	output := strings.ToLower(buf.String())
-	if err != nil { notify("Dangerous problem occured!", "err")
-	} else if strings.Contains(output, "warning") || strings.Contains(output, "already installed") { notify("Pkg "+action+" done with warnings.", "warn")
-	} else { notify("Pkg "+action+" success! ˃ 𖥦 ˂", "success") }
-}
-
-func handleSecure(args []string) {
-	if len(args) < 4 { notify("Usage: --secure clang <file> -o <name>", "warn"); return }
-	compiler, srcFile, outputName := args[0], args[1], args[3]
-	homeDir := os.Getenv("HOME")
-	srcPath, _ := filepath.Abs(srcFile)
-	destSrc := filepath.Join(homeDir, filepath.Base(srcFile))
-	destBin := filepath.Join(homeDir, outputName)
-	input, _ := os.ReadFile(srcPath)
-	os.WriteFile(destSrc, input, 0644)
-	notify("Compiling in $HOME zone...", "success")
-	compileCmd := exec.Command(compiler, destSrc, "-o", destBin)
-	compileCmd.Stdout, compileCmd.Stderr = os.Stdout, os.Stderr
-	if err := compileCmd.Run(); err == nil {
-		notify("Running binary...", "success")
-		runCmd := exec.Command(destBin)
-		runCmd.Stdout, runCmd.Stderr, runCmd.Stdin = os.Stdout, os.Stderr, os.Stdin
-		runCmd.Run()
-	} else { notify("Compilation failed!", "err") }
-}
-
-func printHelp() {
-	fmt.Println(currentStyle.Primary + Bold + "\n--- CORE COMMANDS ---" + Reset)
-	fmt.Println("cd, ls, clear, pkg, exit")
-	fmt.Println("sharp --manage  | Settings & Maintenance")
-	fmt.Println("--secure        | Compile C/C++ bypassing sdcard restrictions")
-	
-	fmt.Println(currentStyle.Accent + Bold + "\n--- THE 15 NEW SHARP TOOLS ---" + Reset)
-	fmt.Println("1.  ping         | Check shell life")
-	fmt.Println("2.  fetch        | Cute system info display")
-	fmt.Println("3.  weather      | Check weather (e.g., weather tokyo)")
-	fmt.Println("4.  calc         | Math tool (e.g., calc 5 * 10)")
-	fmt.Println("5.  diary        | Save a secret entry (e.g., diary I coded today!)")
-	fmt.Println("6.  read-diary   | Read all your secret entries")
-	fmt.Println("7.  history      | View commands typed this session")
-	fmt.Println("8.  roll         | Roll a dice (e.g., roll 20)")
-	fmt.Println("9.  flip         | Flip a coin (Heads/Tails)")
-	fmt.Println("10. matrix       | Hacker screen effect")
-	fmt.Println("11. breathe      | Guided breathing for relaxation")
-	fmt.Println("12. pomodoro     | Start a 25-minute focus timer")
-	fmt.Println("13. joke         | Get a programmer joke")
-	fmt.Println("14. quote        | Get an inspirational quote")
-	fmt.Println("15. lock         | Lock the shell (Default password: 'sharp')\n")
-}
+// --- MAIN LOOP ---
 
 func main() {
-	rand.Seed(time.Now().UnixNano()) // Seed random number generator
-	fmt.Print("\033[H\033[2J") 
-	fmt.Print(getBanner())
-	
+	rand.Seed(time.Now().UnixNano()); loadAliases()
+	fmt.Print("\033[H\033[2J" + getBanner())
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
 		cwd, _ := os.Getwd()
 		fmt.Printf("%sSHARP %s%s%s $ ", Green, Yellow, cwd, Reset)
-
 		if !scanner.Scan() { break }
-		input := scanner.Text()
+		raw := scanner.Text()
+		if strings.TrimSpace(raw) == "" { continue }
+
+		if strings.HasPrefix(raw, "alias ") { handleAlias(raw); continue }
+
+		parts := strings.Fields(raw)
 		
-		// Add to history
-		if strings.TrimSpace(input) != "" {
-			commandHistory = append(commandHistory, input)
+		// Upgraded Expansion Logic
+		if exp, ok := aliases[parts[0]]; ok {
+			raw = exp.Cmd + " " + strings.Join(parts[1:], " ")
+			parts = strings.Fields(raw)
 		}
 
-		parts := strings.Fields(input)
-		if len(parts) == 0 { continue }
+		commandHistory = append(commandHistory, raw)
+		cmd := parts[0]; args := parts[1:]
 
-		command := parts[0]
-		args := parts[1:]
-
-		if command == "sharp" {
-			if len(args) > 0 {
-				if args[0] == "--manage" { handleManage() }
-			}
-			continue
-		}
-
-		switch command {
-		case "exit": notify("Goodbye! ˃ 𖥦 ˂", "success"); return
-		case "help": printHelp()
-		case "--secure": handleSecure(args)
-		case "cd":
-			target := os.Getenv("HOME")
-			if len(args) >= 1 { target = args[0] }
-			if err := os.Chdir(target); err != nil { notify(err.Error(), "err") } else { notify("Moved.", "success") }
-		case "pkg":
-			if len(args) > 0 && (args[0] == "install" || args[0] == "remove") {
-				handlePkg(args[0], args[1:])
-			} else {
-				cmd := exec.Command("pkg", args...)
-				cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
-				cmd.Run()
-			}
-		case "clear": fmt.Print("\033[H\033[2J"); fmt.Print(getBanner())
-		
-		// --- THE 15 NEW COMMANDS ---
-		case "ping": notify("pong! 🐾", "success")
+		switch cmd {
+		case "help":
+			fmt.Println(Bold + "Standard Tools:" + Reset + " cd, ls, pkg, alias, getAlias, getAliasTrash, --secure, calc, history, clear, exit")
+			fmt.Println(Bold + "Extra Tools:" + Reset + " fetch, weather, ping, roll, flip, matrix, breathe, pomodoro, joke, quote, lock, diary, read-diary, notify-usage")
+			fmt.Println(Bold + "Special:" + Reset + " sharp --manage")
+		case "version":
+			fmt.Println(Bold + "\n--- SHARP-shell v2.0 ---" + Reset)
+			fmt.Println(currentStyle.Primary + "[Recent Updates]" + Reset)
+			fmt.Println("- Added cross-environment Alias Manager (getAlias)")
+			fmt.Println("- Added Alias Trash Bin (getAliasTrash)")
+			fmt.Println("- Fixed weather output so you can actually see the clouds")
+			fmt.Println("- Upgraded error notifications to be 100% more condescending")
+			fmt.Println()
+			fmt.Println(currentStyle.Accent + "[Developer Info]" + Reset)
+			fmt.Println("- I love oreo -> rio areos")
+			fmt.Println("- Rioareos social acc on discord: @nahIdontSpeakGivingSocialAcc")
+			fmt.Println()
+		case "notify-usage": handleNotifyUsage()
+		case "getAlias": handleGetAlias()
+		case "getAliasTrash": handleGetAliasTrash(args)
+		case "sharp":
+			if len(args) > 0 && args[0] == "--manage" { handleManage() }
+		case "exit": notify("Finally, some peace and quiet. Goodbye.", "success"); return
+		case "clear": fmt.Print("\033[H\033[2J" + getBanner())
+		case "ping": notify("PONG. Yes, I'm alive. Unlike your brain cell.", "success")
 		case "fetch": handleFetch()
-		case "weather": handleWeather(args)
-		case "calc": handleCalc(args)
-		case "diary": handleDiary(args)
-		case "read-diary": handleReadDiary()
-		case "history":
-			for i, cmd := range commandHistory {
-				fmt.Printf(" %d: %s\n", i+1, cmd)
+		case "weather": 
+			city := ""; if len(args) > 0 { city = args[0] }
+			notify("Fetching clouds... don't blame me if it's raining.", "info")
+			_, err := exec.LookPath("curl")
+			if err != nil {
+				notify("You don't have 'curl' installed. Run 'pkg install curl'.", "err")
+			} else {
+				c := exec.Command("curl", "-s", "wttr.in/"+city+"?0")
+				c.Stdout, c.Stderr = os.Stdout, os.Stderr
+				if err := c.Run(); err != nil { notify("Weather service ignored you.", "err") }
 			}
+		case "calc": handleCalc(args)
+		case "diary": handleDiary(args, false)
+		case "read-diary": handleDiary(nil, true)
+		case "history":
+			for i, h := range commandHistory { fmt.Printf("%d: %s\n", i+1, h) }
 		case "roll":
-			max := 6
-			if len(args) > 0 { if val, err := strconv.Atoi(args[0]); err == nil && val > 0 { max = val } }
-			notify(fmt.Sprintf("You rolled a %d!", rand.Intn(max)+1), "success")
+			m := 6; if len(args) > 0 { m, _ = strconv.Atoi(args[0]) }
+			notify(fmt.Sprintf("You rolled a %d. Luck won't save you here.", rand.Intn(m)+1), "success")
 		case "flip":
-			if rand.Intn(2) == 0 { notify("Coin landed on: HEADS", "success") } else { notify("Coin landed on: TAILS", "success") }
+			side := "TAILS"; if rand.Intn(2) == 0 { side = "HEADS" }
+			notify("Landed on "+side+". 50/50, just like your code working.", "success")
 		case "matrix": handleMatrix()
 		case "breathe": handleBreathe()
 		case "pomodoro":
-			notify("Pomodoro started. Focus for 25 minutes! ˃ 𖥦 ˂", "warn")
-			time.Sleep(25 * time.Minute)
-			notify("Pomodoro complete! Take a 5-minute break.", "success")
-			fmt.Print("\a") // Terminal bell sound
+			notify("Starting timer. Focus for once.", "warn"); time.Sleep(25 * time.Minute); notify("Break time.", "success")
 		case "joke":
-			jokes := []string{"Why do programmers prefer dark mode? Because light attracts bugs.", "I would tell you a UDP joke, but you might not get it.", "There are 10 types of people: those who understand binary, and those who don't."}
-			notify(jokes[rand.Intn(len(jokes))], "success")
+			j := []string{"Your code.", "Why do programmers wear glasses? Because they can't C#."}
+			notify(j[rand.Intn(len(j))], "success")
 		case "quote":
-			quotes := []string{"Talk is cheap. Show me the code. - Linus Torvalds", "First, solve the problem. Then, write the code. - John Johnson", "Make it work, make it right, make it fast. - Kent Beck"}
-			notify(quotes[rand.Intn(len(quotes))], "success")
-		case "lock": handleLock(scanner)
-		
+			q := []string{"'It works on my machine.' - Every dev ever.", "'Solve first, code second.'"}
+			notify(q[rand.Intn(len(q))], "success")
+		case "lock":
+			fmt.Print("\033[H\033[2J" + Red + "SHELL LOCKED." + Reset + " Password: ")
+			for scanner.Scan() { if scanner.Text() == shellPassword { break }; fmt.Print("Wrong. Try again: ") }
+			notify("Unlocked. Don't forget it again.", "success")
+		case "pkg": handlePkg(args)
+		case "--secure": handleSecure(args)
+		case "cd":
+			target := os.Getenv("HOME"); if len(args) > 0 { target = args[0] }
+			if err := os.Chdir(target); err != nil { notify("I can't go to '"+target+"'. Does it exist?", "err") } else {
+				newDir, _ := os.Getwd(); os.Setenv("PWD", newDir)
+			}
 		default:
-			cmd := exec.Command(command, args...)
-			cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
-			if err := cmd.Run(); err != nil { notify("Command failed or not found.", "err") }
+			c := exec.Command(cmd, args...); c.Stdout, c.Stderr, c.Stdin = os.Stdout, os.Stderr, os.Stdin
+			if err := c.Run(); err != nil { notify("I don't know what '"+cmd+"' is. Are you speaking gibberish?", "err") }
 		}
 	}
 }
